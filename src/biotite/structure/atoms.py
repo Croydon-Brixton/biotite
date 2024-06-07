@@ -504,7 +504,7 @@ class Atom(Copyable):
         annot = annot + ', res_name="' + self._annot["res_name"] + '"'
         annot = annot + ', hetero=' + str(self._annot["hetero"])
         annot = annot + ', atom_name="' + self._annot["atom_name"] + '"'
-        annot = annot + ', element="' + self._annot["element"] + '"'
+        annot = annot + ', element="' + str(self._annot["element"]) + '"'
         return f'Atom(np.{np.array_repr(self.coord)}, {annot})'
 
     @property
@@ -677,12 +677,17 @@ class AtomArray(_AtomArrayBase):
     def __repr__(self):
         """Represent AtomArray as a string for debugging."""
         atoms = ''
-        for i in range(0, self.array_length()):
+        n_atoms = self.array_length()
+        for i in range(0, n_atoms):
             if len(atoms) == 0:
                 atoms = '\n\t' + self.get_atom(i).__repr__()
+            elif i > 10 and i < (n_atoms - 10):
+                if i == 11:
+                    atoms += '\n\t... (' + str(n_atoms - 20) + ' not shown) ...'
+                continue
             else:
                 atoms = atoms + ',\n\t' + self.get_atom(i).__repr__()
-        return f'array([{atoms}\n])'
+        return f'AtomArray([{atoms}\n])'
 
     @property
     def shape(self):
