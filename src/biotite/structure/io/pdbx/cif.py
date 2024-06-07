@@ -11,8 +11,8 @@ import shlex
 from collections.abc import MutableMapping, Sequence
 import numpy as np
 from .component import _Component, MaskValue
-from .error import DeserializationError, SerializationError
-from ....file import File, is_open_compatible, is_text
+from ....file import File, is_open_compatible, is_text, DeserializationError, \
+                     SerializationError
 
 
 UNICODE_CHAR_SIZE = 4
@@ -402,7 +402,9 @@ class CIFCategory(_Component, MutableMapping):
                     f"while the first column has row_count {self._row_count}"
                 )
 
-        if self._row_count == 1:
+        if self._row_count == 0:
+            raise ValueError("At least one row is required")
+        elif self._row_count == 1:
             lines = self._serialize_single()
         else:
             lines = self._serialize_looped()
@@ -766,7 +768,7 @@ class CIFFile(_Component, File, MutableMapping):
 
     @property
     def lines(self):
-        return "\n".join(self.serialize())
+        return self.serialize().splitlines()
 
     @property
     def block(self):
@@ -1025,4 +1027,6 @@ def _multiline(value):
 def _arrayfy(data):
     if not isinstance(data, (Sequence, np.ndarray)) or isinstance(data, str):
         data = [data]
+    elif len(data) == 0:
+        raise ValueError("Array must contain at least one element")
     return np.asarray(data)
