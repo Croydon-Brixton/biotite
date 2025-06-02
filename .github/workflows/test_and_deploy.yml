@@ -16,7 +16,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  CIBW_BUILD: cp310-* cp311-* cp312-* cp313-*
+  CIBW_BUILD: cp311-* cp312-* cp313-*
   CIBW_TEST_EXTRAS: test
   CIBW_TEST_COMMAND: >
     pytest {project}
@@ -32,7 +32,7 @@ env:
   # mussllinux takes 6+ hrs to build and test so ignore it
   CIBW_TEST_SKIP: "*musllinux* *-macosx_arm64"
   # Configuration for the architecture-agnostic jobs
-  PY_VERSION: "3.11"  # Keep in sync with version in environment.yml
+  PY_VERSION: "3.12"  # Keep in sync with version in environment.yml
 
 
 jobs:
@@ -106,7 +106,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install cibuildwheel
         # MAKE SURE THIS STAYS IN SYNC WITH THE LOWER GHA cibuildwheel
-        run: pipx install cibuildwheel==2.20.0
+        run: pipx install cibuildwheel==2.23.3
       - id: set-matrix
         run: |
           MATRIX=$(
@@ -157,7 +157,7 @@ jobs:
 
       - name: Build & (optionally) test wheels
         # MAKE SURE THIS STAYS IN SYNC WITH THE UPPER pipx call to cibuildwheel
-        uses: pypa/cibuildwheel@v2.20.0
+        uses: pypa/cibuildwheel@v2.23.3
         with:
           only: ${{ matrix.dist }}
 
@@ -209,10 +209,6 @@ jobs:
           miniforge-version: latest
       - name: Install distribution
         run: pip install ./dist/*.whl
-      - name: "TEMP: Skip DSSP tests"
-        # TEMP: Omit DSSP tests for now until conda-forge DSSP is functional
-        # (https://github.com/conda-forge/dssp-feedstock/pull/4)
-        run: mamba uninstall dssp
       - name: Run tests
         # Running NCBI BLAST and SRA takes too long
         # The tests on the NCBI Entrez database are not reliable enough
@@ -280,10 +276,20 @@ jobs:
       with:
         environment-file: environment.yml
         miniforge-version: latest
+    - name: Restore cached partially build docs from a failed previous build
+      id: cache-docs-restore
+      uses: actions/cache/restore@v4
+      with:
+        key: docs-${{ github.sha }}
+        path: |
+          doc/examples/backreferences
+          doc/examples/gallery
+          build/doc
+          build/jupyter_execute
     - name: Install distribution
       run: pip install dist/*.whl
     - name: Build base documentation
-      run: sphinx-build -a -D plot_gallery=0 doc build//doc
+      run: sphinx-build -a -D plot_gallery=0 doc build/doc
     - name: Build tutorial and gallery
       if: >
         (
@@ -291,16 +297,27 @@ jobs:
           github.event.action == 'published'
         )
         || github.event_name == 'workflow_dispatch'
-      run: sphinx-build -a doc build//doc
+      run: sphinx-build -a doc build/doc
+    - name: Cache partially built docs from failed build
+      id: cache-docs-save
+      if: failure()
+      uses: actions/cache/save@v4
+      with:
+        key: ${{ steps.cache-docs-restore.outputs.cache-primary-key }}
+        path: |
+          doc/examples/backreferences
+          doc/examples/gallery
+          build/doc
+          build/jupyter_execute
     - name: Zip documentation
       run: |
           cd build
-          zip -r ..//dist//doc.zip doc
+          zip -r ../dist/doc.zip doc
           cd ..
     - uses: actions/upload-artifact@v4
       with:
         name: documentation
-        path: dist//doc.zip
+        path: dist/doc.zip
 
 
   benchmark:

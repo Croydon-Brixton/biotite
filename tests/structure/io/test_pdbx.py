@@ -7,6 +7,7 @@ import itertools
 import warnings
 from io import BytesIO
 from os.path import join, splitext
+from pathlib import Path
 import msgpack
 import numpy as np
 import pytest
@@ -14,6 +15,7 @@ from pytest import approx
 import biotite
 import biotite.sequence as seq
 import biotite.structure as struc
+import biotite.structure.io.pdb as pdb
 import biotite.structure.io.pdbx as pdbx
 from biotite.structure.io.pdbx.bcif import _encode_numpy as encode_numpy
 from biotite.structure.io.pdbx.compress import _get_decimal_places as get_decimal_places
@@ -88,18 +90,22 @@ def test_split_one_line(cif_line, expected_fields):
     assert list(pdbx.cif._split_one_line(cif_line)) == expected_fields
 
 
+@pytest.mark.parametrize("find_matches_by_dict", [False, True])
+@pytest.mark.parametrize("model", [None, 1, -1])
 @pytest.mark.parametrize(
-    "format, path, model",
-    itertools.product(
-        ["cif", "bcif"], glob.glob(join(data_dir("structure"), "*.cif")), [None, 1, -1]
-    ),
+    "path", Path(data_dir("structure")).glob("*.cif"), ids=lambda p: p.stem
 )
-def test_conversion(tmpdir, format, path, model):
+@pytest.mark.parametrize("format", ["cif", "bcif"])
+def test_conversion(monkeypatch, tmpdir, format, path, model, find_matches_by_dict):
     """
     Test serializing and deserializing a structure from a file
     restores the same structure.
     """
     DELETED_ANNOTATION = "auth_comp_id"
+
+    if find_matches_by_dict:
+        # Lower the threshold to 0 to force usage of `_find_matches_by_dict()`
+        monkeypatch.setattr(pdbx.convert, "FIND_MATCHES_SWITCH_THRESHOLD", 0)
 
     base_path = splitext(path)[0]
     if format == "cif":
@@ -145,45 +151,54 @@ def test_conversion(tmpdir, format, path, model):
 
 
 @pytest.mark.parametrize(
-    "format, path",
-    itertools.product(
-        ["cif", "bcif"],
-        glob.glob(join(data_dir("structure"), "*.cif")),
-    ),
+    "pdb_id",
+    [
+        "1aki",  # has no altloc IDs
+        "3o5r",  # has altloc IDs
+    ],
 )
-def test_bond_conversion(tmpdir, format, path):
+def test_filter_altloc(pdb_id):
     """
-    Test serializing and deserializing bonds from a file
-    restores the bonds.
+    Check if the different ``altloc`` options give the expected results.
+    """
+    pdbx_file = pdbx.BinaryCIFFile.read(join(data_dir("structure"), f"{pdb_id}.bcif"))
+    atoms = {}
+    for altloc in ["first", "occupancy", "all"]:
+        atoms[altloc] = pdbx.get_structure(pdbx_file, model=1, altloc=altloc)
 
-    This test is similar to :func:`test_conversion`, but intra bonds
-    are written to ``chem_comp_bond`` and read from there, instead of
-    relying on the CCD.
-    """
-    base_path = splitext(path)[0]
-    if format == "cif":
-        data_path = base_path + ".cif"
-        File = pdbx.CIFFile
+    # The 'altloc_id' annotation should only be present in the 'altloc=all' case
+    assert "altloc_id" in atoms["all"].get_annotation_categories()
+    assert "altloc_id" not in atoms["first"].get_annotation_categories()
+    assert "altloc_id" not in atoms["occupancy"].get_annotation_categories()
+    # Independent of which altloc atom is selected, only one atom must be selected...
+    assert atoms["occupancy"].array_length() == atoms["first"].array_length()
+    # ...with the exception of the 'altloc=all' case in which more atoms are selected
+    if np.any(atoms["all"].altloc_id != "."):
+        assert atoms["all"].array_length() > atoms["first"].array_length()
     else:
-        data_path = base_path + ".bcif"
-        File = pdbx.BinaryCIFFile
+        assert atoms["all"].array_length() == atoms["first"].array_length()
 
-    pdbx_file = File.read(data_path)
+
+@pytest.mark.parametrize("format", ["cif", "bcif"])
+def test_bonds_from_ccd(format):
+    """
+    Check if bonds can also be correctly restored from a CIF file that does not contain
+    explicit bond information (i.e. the `chem_comp_bond` and `struct_conn` categories)
+    using the CCD.
+
+    Importantly a structure is chosen that does not contain non-standard inter-residue
+    bonds, such as disulfide bridges or glycosylations, as those bonds would require
+    explicit bond information.
+    """
+    path = join(data_dir("structure"), f"1l2y.{format}")
+    File = pdbx.CIFFile if format == "cif" else pdbx.BinaryCIFFile
+
+    pdbx_file = File.read(path)
     atoms = pdbx.get_structure(pdbx_file, model=1, include_bonds=True)
     ref_bonds = atoms.bonds
 
-    pdbx_file = File()
-    # The important difference to `test_conversion()` is `include_bonds`
-    pdbx.set_structure(pdbx_file, atoms, include_bonds=True)
-    file_path = join(tmpdir, f"test.{format}")
-    pdbx_file.write(file_path)
-
-    pdbx_file = File.read(file_path)
-    # Ensure that the CCD fallback is not used,
-    # i.e. the bonds can be properly read from ``chem_comp_bond``
-    with warnings.catch_warnings():
-        warnings.simplefilter("error")
-        test_bonds = pdbx.get_structure(pdbx_file, model=1, include_bonds=True).bonds
+    del pdbx_file.block["chem_comp_bond"]
+    test_bonds = pdbx.get_structure(pdbx_file, model=1, include_bonds=True).bonds
 
     assert test_bonds == ref_bonds
 
@@ -218,7 +233,7 @@ def test_bond_sparsity():
     """
     Ensure that only as much intra-residue bonds are written as necessary,
     i.e. the created ``chem_comp_bond`` category has at maximum category many rows as
-    the reference NextGen CIF file.
+    the reference PDBx file.
 
     Less bonds are allowed, as not all atoms that a residue has in the CCD are actually
     present in the structure.
@@ -226,13 +241,13 @@ def test_bond_sparsity():
     This tests a previous bug, where duplicate intra-residue bonds were written
     (https://github.com/biotite-dev/biotite/issues/652).
     """
-    path = join(data_dir("structure"), "nextgen", "pdb_00001l2y_xyz-enrich.cif")
-    ref_pdbx_file = pdbx.CIFFile.read(path)
+    path = join(data_dir("structure"), "1l2y.bcif")
+    ref_pdbx_file = pdbx.BinaryCIFFile.read(path)
     ref_bond_number = ref_pdbx_file.block["chem_comp_bond"].row_count
 
     atoms = pdbx.get_structure(ref_pdbx_file, model=1, include_bonds=True)
-    test_pdbx_file = pdbx.CIFFile()
-    pdbx.set_structure(test_pdbx_file, atoms, include_bonds=True)
+    test_pdbx_file = pdbx.BinaryCIFFile()
+    pdbx.set_structure(test_pdbx_file, atoms)
     test_bond_number = test_pdbx_file.block["chem_comp_bond"].row_count
 
     assert test_bond_number <= ref_bond_number
@@ -287,31 +302,6 @@ def test_dynamic_dtype():
     assert (atoms.chain_id == CHAIN_ID).all()
 
 
-def test_intra_bond_residue_parsing():
-    """
-    Check if intra-residue bonds can be parsed from a NextGen CIF file
-    and expect the same bonds as the CCD-based ones from an *original*
-    CIF file.
-    """
-    cif_path = join(data_dir("structure"), "1l2y.cif")
-    cif_file = pdbx.CIFFile.read(cif_path)
-    ref_bonds = pdbx.get_structure(cif_file, model=1, include_bonds=True).bonds
-
-    nextgen_cif_path = join(
-        data_dir("structure"), "nextgen", "pdb_00001l2y_xyz-enrich.cif"
-    )
-    nextgen_cif_file = pdbx.CIFFile.read(nextgen_cif_path)
-    # Ensure that the CCD fallback is not used,
-    # i.e. the bonds can be properly read from ``chem_comp_bond``
-    with warnings.catch_warnings():
-        warnings.simplefilter("error")
-        test_bonds = pdbx.get_structure(
-            nextgen_cif_file, model=1, include_bonds=True
-        ).bonds
-
-    assert test_bonds == ref_bonds
-
-
 @pytest.mark.parametrize("format", ["cif", "bcif"])
 def test_any_bonds(tmpdir, format):
     """
@@ -339,7 +329,7 @@ def test_any_bonds(tmpdir, format):
     atoms.bonds = ref_bonds
 
     pdbx_file = File()
-    pdbx.set_structure(pdbx_file, atoms, include_bonds=True)
+    pdbx.set_structure(pdbx_file, atoms)
     file_path = join(tmpdir, f"test.{format}")
     pdbx_file.write(file_path)
 
@@ -398,7 +388,7 @@ def test_setting_empty_structure():
     atoms.coord[:, :] = 0.0
     empty_bonds = struc.BondList(atoms.array_length())
     atoms.bonds = empty_bonds
-    pdbx.set_structure(pdbx.CIFFile(), atoms, include_bonds=True)
+    pdbx.set_structure(pdbx.CIFFile(), atoms)
 
 
 @pytest.mark.parametrize("format", ["cif", "bcif"])
@@ -489,26 +479,104 @@ def test_assembly_chain_count(format, pdb_id, model):
         ("1f2n", "4", 6),
         # Multiple combined operations
         ("1f2n", "6", 60),
+        # Multiple entries in pdbx_struct_assembly_gen for the same assembly_id
+        ("4zxb", "1", 2),
+        # Multiple entries in pdbx_struct_assembly_gen for the same assembly_id and chain
+        ("1ncb", "2", 8),
     ],
 )
 def test_assembly_sym_id(pdb_id, assembly_id, symmetric_unit_count):
     """
     Check if the :func:`get_assembly()` function returns the correct
-    symmetry ID annotation for a known example.
+    number of symmetry IDs for a known example.
     """
     pdbx_file = pdbx.BinaryCIFFile.read(join(data_dir("structure"), f"{pdb_id}.bcif"))
     assembly = pdbx.get_assembly(pdbx_file, assembly_id=assembly_id)
-    # 'unique_indices' contains the FIRST occurence of each unique value
-    unique_sym_ids, unique_indices = np.unique(assembly.sym_id, return_index=True)
-    # Sort by first occurrence
-    order = np.argsort(unique_indices)
-    unique_sym_ids = unique_sym_ids[order]
-    unique_indices = unique_indices[order]
-    assert unique_sym_ids.tolist() == list(range(symmetric_unit_count))
-    # Every asymmetric unit should have the same length,
-    # as each operation is applied to all atoms in the asymmetric unit
-    asym_lengths = np.diff(np.append(unique_indices, assembly.array_length()))
-    assert (asym_lengths == asym_lengths[0]).all()
+    assert sorted(np.unique(assembly.sym_id).tolist()) == list(
+        range(symmetric_unit_count)
+    )
+
+
+@pytest.mark.parametrize("model", [None, 1])
+@pytest.mark.parametrize("center", [False, True])
+def test_unit_cell_trivial(model, center):
+    """
+    The 'P 1' space group has no symmetries.
+    Hence the unit cell from this space group should be the same as the asymmetric unit.
+    """
+    pdbx_file = pdbx.BinaryCIFFile.read(join(data_dir("structure"), "1l2y.bcif"))
+    # Give the structure the 'P 1' space group
+    pdbx_file.block["symmetry"] = pdbx.BinaryCIFCategory(
+        {"space_group_name_H-M": "P 1"}
+    )
+    # Give the structure arbitrary unit cell dimensions,
+    # it needs only be large enough to contain the asymmetric unit
+    pdbx_file.block["cell"] = pdbx.BinaryCIFCategory(
+        {
+            "length_a": 10, "length_b": 20, "length_c": 30,
+            "angle_alpha": 90, "angle_beta": 90, "angle_gamma": 90,
+        }
+    )  # fmt: skip
+    if center:
+        # Ensure that the asymmetric unit is already inside the unit cell,
+        # as the centroid may sometimes be slightly outside
+        for col_name in ["Cartn_x", "Cartn_y", "Cartn_z"]:
+            pdbx_file.block["atom_site"][col_name] = (
+                pdbx_file.block["atom_site"][col_name].as_array(np.float32) + 1.0
+            )
+
+    asymmetric_unit = pdbx.get_structure(pdbx_file, model)
+    unit_cell = pdbx.get_unit_cell(pdbx_file, center, model)
+
+    for category in asymmetric_unit.get_annotation_categories():
+        assert (
+            unit_cell.get_annotation(category).tolist()
+            == asymmetric_unit.get_annotation(category).tolist()
+        )
+    assert unit_cell.coord.flatten().tolist() == approx(
+        asymmetric_unit.coord.flatten().tolist()
+    )
+
+
+@pytest.mark.parametrize(
+    "pdb_path", Path(data_dir("structure")).glob("*.pdb"), ids=lambda p: p.stem
+)
+def test_unit_cell_pdb_consistency(pdb_path):
+    """
+    Check the structure parsed via :func:`pdbx.get_unit_cell()` against
+    :func:`pdb.get_unit_cell()`, which uses a different implementation
+    (transformations from the PDB file directly).
+    """
+    pdb_file = pdb.PDBFile.read(pdb_path)
+    if pdb_file.get_remark(290) is None:
+        # File does not contain a crystal structure -> skip
+        return
+    ref_unit_cell = pdb_file.get_unit_cell(model=1)
+
+    pdbx_file = pdbx.BinaryCIFFile.read(pdb_path.with_suffix(".bcif"))
+    # The reference transformations do not center the copies,
+    # so we do not do this here either
+    test_unit_cell = pdbx.get_unit_cell(pdbx_file, model=1, center=False)
+
+    for category in ref_unit_cell.get_annotation_categories():
+        assert (
+            test_unit_cell.get_annotation(category).tolist()
+            == ref_unit_cell.get_annotation(category).tolist()
+        )
+    # The copies are not necessarily in the same order
+    # -> Compare each asymmetric unit in the unit cell separately and expect to have
+    #    one match
+    sym_id_masks = [
+        test_unit_cell.sym_id == sym_id for sym_id in np.unique(test_unit_cell.sym_id)
+    ]
+    distance_matrix = np.full((len(sym_id_masks), len(sym_id_masks)), np.nan)
+    for i, mask_i in enumerate(sym_id_masks):
+        for j, mask_j in enumerate(sym_id_masks):
+            distance_matrix[i, j] = np.mean(
+                struc.distance(test_unit_cell[mask_i], ref_unit_cell[mask_j])
+            )
+    # Expect one match for each asymmetric unit
+    assert np.all(np.any(distance_matrix < 1e-3, axis=0))
 
 
 @pytest.mark.parametrize(
@@ -575,6 +643,58 @@ def test_get_sequence(format):
         "CCGGAGTCAGGAAACCTGCCTGCCGTC"
     )
     assert type(sequences_2["A"]) is seq.NucleotideSequence
+
+
+def test_get_sse():
+    """
+    Check if the secondary structure elements are returned for a short structure
+    where the reference secondary structure elements are taken from Mol*
+    (https://www.rcsb.org/3d-view/1AKI).
+    """
+    TOTAL_LENGTH = 129
+    # Ranges are given in terms of residue IDs, and the end is inclusive
+    HELIX_RANGES = [
+        (5, 14),
+        (20, 22),
+        (25, 36),
+        (80, 84),
+        (89, 101),
+        (104, 107),
+        (109, 114),
+        (120, 123),
+    ]
+    SHEET_RANGES = [
+        (43, 45),
+        (51, 53),
+    ]
+
+    ref_sse = np.full(TOTAL_LENGTH, "c", dtype="U1")
+    for helix_range in HELIX_RANGES:
+        # Conver to zero-based indexing
+        ref_sse[helix_range[0] - 1 : helix_range[1]] = "a"
+    for sheet_range in SHEET_RANGES:
+        ref_sse[sheet_range[0] - 1 : sheet_range[1]] = "b"
+
+    pdbx_file = pdbx.BinaryCIFFile.read(join(data_dir("structure"), "1aki.bcif"))
+    test_sse = pdbx.get_sse(pdbx_file)["A"]
+
+    assert test_sse.tolist() == ref_sse.tolist()
+
+
+@pytest.mark.parametrize("path", glob.glob(join(data_dir("structure"), "*.bcif")))
+def test_get_sse_length(path):
+    """
+    If `match_model` is set in :func:`get_sse()`, the length of the returned array
+    must match the number of residues in the structure.
+    """
+    pdbx_file = pdbx.BinaryCIFFile.read(path)
+    atoms = pdbx.get_structure(pdbx_file, model=1)
+    atoms = atoms[struc.filter_amino_acids(atoms)]
+    sse = pdbx.get_sse(pdbx_file, match_model=1)
+
+    for chain_id in np.unique(atoms.chain_id):
+        chain = atoms[atoms.chain_id == chain_id]
+        assert len(sse[chain_id]) == struc.get_residue_count(chain)
 
 
 def test_bcif_encoding():
@@ -831,6 +951,10 @@ def test_compress_file(path):
     the same as from the uncompressed file, while the file size it at least as small
     as the file compressed by the RCSB PDB.
     """
+    # Use a relatively high precision to increase strictness of of the equality check
+    ATOL = 1e-5
+    RTOL = 1e-10
+
     orig_file = pdbx.BinaryCIFFile.read(path)
 
     # Create an equivalent file without the original encoding
@@ -840,7 +964,9 @@ def test_compress_file(path):
         block[category_name] = _clear_encoding(category)
     uncompressed_file["block"] = block
 
-    compressed_file = pdbx.compress(uncompressed_file)
+    compressed_file = pdbx.compress(uncompressed_file, rtol=RTOL, atol=ATOL)
+    # Remove any cached data columns by re-serializing and deserializing
+    compressed_file = pdbx.BinaryCIFFile.deserialize(compressed_file.serialize())
 
     # Check if the data is unaltered after compression
     # Direct equality check is not possible, as the encoding may be different
@@ -854,7 +980,17 @@ def test_compress_file(path):
                     if ref_data is None:
                         assert test_data is None
                     else:
-                        assert test_data.array.tolist() == ref_data.array.tolist()
+                        if np.issubdtype(ref_data.array.dtype, np.floating):
+                            # The reference may have used direct ByteArrayEncoding,
+                            # which is not able to exactly represent the correct data
+                            # due to numerical inaccuracies
+                            # -> Expect very small differences
+                            # Furthermore, the compression may have different precision
+                            assert np.allclose(
+                                test_data.array, ref_data.array, rtol=RTOL, atol=ATOL
+                            )
+                        else:
+                            assert test_data.array.tolist() == ref_data.array.tolist()
                 except AssertionError:
                     raise AssertionError(f"{category_name}.{column_name} {attr_name}")
 
@@ -862,15 +998,39 @@ def test_compress_file(path):
     assert _file_size(compressed_file) <= _file_size(orig_file)
 
 
+@pytest.mark.parametrize("value", [1e10, 1e-10, np.nan, np.inf, -np.inf])
+def test_extreme_float_compression(value):
+    """
+    Check if :func:`compress()` correctly falls back to direct byte encoding of floats
+    in extreme cases where fixed point encoding would lead to integer
+    underflow/overflow or the value could not be represented by an integer.
+    """
+    # Not only very small/large values, but a large difference between the values are
+    # required, to make fixed point encoding fail
+    ref_array = np.array([value, 1.0])
+
+    compressed_data = pdbx.compress(pdbx.BinaryCIFData(ref_array), atol=0)
+    serialized_compressed_data = compressed_data.serialize()
+    data = pdbx.BinaryCIFData.deserialize(serialized_compressed_data)
+
+    # Check that no fixed point encoding was used
+    assert len(data.encoding) == 1
+    assert type(data.encoding[0]) is pdbx.ByteArrayEncoding
+    assert data.array.tolist() == pytest.approx(ref_array.tolist(), nan_ok=True)
+
+
 @pytest.mark.parametrize(
     "number, ref_decimals",
     [
         (1.0, 0),
-        (1.2345, 4),
-        (0.00012345, 8),
+        (1.23, 2),
+        (0.001, 3),
+        (0.0012345, 4),
         (12300, -2),
-        (123.456, 3),
-        (123.0000000001, 0),
+        (123.45, 2),
+        (123.45678, 4),
+        (123.00001, 0),
+        (0.00001, 0),
         (0.0, 0),
     ],
 )
@@ -879,7 +1039,7 @@ def test_decimal_places(number, ref_decimals):
     Check if :func`:_get_decimal_places()` returns the correct number of decimal places
     for known examples.
     """
-    test_decimals = get_decimal_places(np.array([number]), 1e-6)
+    test_decimals = get_decimal_places(np.array([number]), 1e-6, 1e-4)
     assert test_decimals == ref_decimals
 
 

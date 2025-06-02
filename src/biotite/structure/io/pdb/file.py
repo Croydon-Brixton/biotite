@@ -24,6 +24,7 @@ from biotite.structure.io.pdb.hybrid36 import (
     encode_hybrid36,
     max_hybrid36_number,
 )
+from biotite.structure.io.util import number_of_integer_digits
 from biotite.structure.repair import infer_elements
 from biotite.structure.util import matrix_rotate
 
@@ -953,7 +954,7 @@ class PDBFile(TextFile):
 
         return assembly
 
-    def get_symmetry_mates(
+    def get_unit_cell(
         self, model=None, altloc="first", extra_fields=[], include_bonds=False
     ):
         """
@@ -1020,7 +1021,7 @@ class PDBFile(TextFile):
 
         >>> import os.path
         >>> file = PDBFile.read(os.path.join(path_to_structures, "1aki.pdb"))
-        >>> atoms_in_unit_cell = file.get_symmetry_mates(model=1)
+        >>> atoms_in_unit_cell = file.get_unit_cell(model=1)
         """
         # Get base structure
         structure = self.get_structure(
@@ -1039,6 +1040,83 @@ class PDBFile(TextFile):
         transform_lines = [line for line in remark_lines if line.startswith("  SMTRY")]
         rotations, translations = _parse_transformations(transform_lines)
         return _apply_transformations(structure, rotations, translations)
+
+    def get_symmetry_mates(
+        self, model=None, altloc="first", extra_fields=[], include_bonds=False
+    ):
+        """
+        Build a structure model containing all symmetric copies
+        of the structure within a single unit cell, given by the space
+        group.
+
+        This function receives the data from ``REMARK 290`` records in
+        the file.
+        Consequently, this remark must be present in the file, which is
+        usually only true for crystal structures.
+
+        DEPRECATED: Use :meth:`get_unit_cell()` instead.
+
+        Parameters
+        ----------
+        model : int, optional
+            If this parameter is given, the function will return an
+            :class:`AtomArray` from the atoms corresponding to the given
+            model number (starting at 1).
+            Negative values are used to index models starting from the
+            last model instead of the first model.
+            If this parameter is omitted, an :class:`AtomArrayStack`
+            containing all models will be returned, even if the
+            structure contains only one model.
+        altloc : {'first', 'occupancy', 'all'}
+            This parameter defines how *altloc* IDs are handled:
+                - ``'first'`` - Use atoms that have the first
+                  *altloc* ID appearing in a residue.
+                - ``'occupancy'`` - Use atoms that have the *altloc* ID
+                  with the highest occupancy for a residue.
+                - ``'all'`` - Use all atoms.
+                  Note that this leads to duplicate atoms.
+                  When this option is chosen, the ``altloc_id``
+                  annotation array is added to the returned structure.
+        extra_fields : list of str, optional
+            The strings in the list are optional annotation categories
+            that should be stored in the output array or stack.
+            These are valid values:
+            ``'atom_id'``, ``'b_factor'``, ``'occupancy'`` and
+            ``'charge'``.
+        include_bonds : bool, optional
+            If set to true, a :class:`BondList` will be created for the
+            resulting :class:`AtomArray` containing the bond information
+            from the file.
+            Bonds, whose order could not be determined from the
+            *Chemical Component Dictionary*
+            (e.g. especially inter-residue bonds),
+            have :attr:`BondType.ANY`, since the PDB format itself does
+            not support bond orders.
+
+        Returns
+        -------
+        symmetry_mates : AtomArray or AtomArrayStack
+            All atoms within a single unit cell.
+            The return type depends on the `model` parameter.
+
+        Notes
+        -----
+        To expand the structure beyond a single unit cell, use
+        :func:`repeat_box()` with the return value as its
+        input.
+
+        Examples
+        --------
+
+        >>> import os.path
+        >>> file = PDBFile.read(os.path.join(path_to_structures, "1aki.pdb"))
+        >>> atoms_in_unit_cell = file.get_symmetry_mates(model=1)
+        """
+        warnings.warn(
+            "'get_symmetry_mates()' is deprecated, use 'get_unit_cell()' instead",
+            DeprecationWarning,
+        )
+        return self.get_unit_cell(model, altloc, extra_fields, include_bonds)
 
     def _index_models_and_atoms(self):
         # Line indices where a new model starts
@@ -1248,21 +1326,21 @@ def _check_pdb_compatibility(array, hybrid36):
     if any([len(name) > 4 for name in array.atom_name]):
         raise BadStructureError("Some atom names exceed 4 characters")
     for i, coord_name in enumerate(["x", "y", "z"]):
-        n_coord_digits = _number_of_integer_digits(array.coord[..., i])
+        n_coord_digits = number_of_integer_digits(array.coord[..., i])
         if n_coord_digits > 4:
             raise BadStructureError(
                 f"4 pre-decimal columns for {coord_name}-coordinates are "
                 f"available, but array would require {n_coord_digits}"
             )
     if "b_factor" in annot_categories:
-        n_b_factor_digits = _number_of_integer_digits(array.b_factor)
+        n_b_factor_digits = number_of_integer_digits(array.b_factor)
         if n_b_factor_digits > 3:
             raise BadStructureError(
                 "3 pre-decimal columns for B-factor are available, "
                 f"but array would require {n_b_factor_digits}"
             )
     if "occupancy" in annot_categories:
-        n_occupancy_digits = _number_of_integer_digits(array.occupancy)
+        n_occupancy_digits = number_of_integer_digits(array.occupancy)
         if n_occupancy_digits > 3:
             raise BadStructureError(
                 "3 pre-decimal columns for occupancy are available, "
@@ -1270,21 +1348,9 @@ def _check_pdb_compatibility(array, hybrid36):
             )
     if "charge" in annot_categories:
         # The sign can be omitted is it is put into the adjacent column
-        n_charge_digits = _number_of_integer_digits(np.abs(array.charge))
+        n_charge_digits = number_of_integer_digits(np.abs(array.charge))
         if n_charge_digits > 1:
             raise BadStructureError(
                 "1 column for charge is available, "
                 f"but array would require {n_charge_digits}"
             )
-
-
-def _number_of_integer_digits(values):
-    """
-    Get the maximum number of characters needed to represent the
-    pre-decimal positions of the given numeric values.
-    """
-    values = values.astype(int, copy=False)
-    n_digits = 0
-    n_digits = max(n_digits, len(str(np.min(values))))
-    n_digits = max(n_digits, len(str(np.max(values))))
-    return n_digits

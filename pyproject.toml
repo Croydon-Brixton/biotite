@@ -1,15 +1,15 @@
 [project]
 name = "biotite"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 description = "A comprehensive library for computational molecular biology"
 readme = "README.rst"
 authors = [{name = "The Biotite contributors"}]
-license = {"file" = "LICENSE.rst"}
+license = "BSD-3-Clause"
+license-files = ["LICENSE.rst"]
 classifiers = [
     "Development Status :: 5 - Production/Stable",
     "Intended Audience :: Developers",
     "Intended Audience :: Science/Research",
-    "License :: OSI Approved :: BSD License",
     "Natural Language :: English",
     "Operating System :: POSIX :: Linux",
     "Operating System :: MacOS",
@@ -64,6 +64,8 @@ ignore = [
 "doc/conf.py" = ["E402"]
 # Due to `from .module import *` imports in `__init__.py` modules
 "__init__.py" = ["F403", "TID252"]
+# Due to package existence check before other modules are imported
+"src/biotite/interface/**/__init__.py" = ["E402"]
 # Due to pymol scripts that are evaluated in other example scripts
 "doc/examples/**/*_pymol.py" = ["F821"]
 # Due to 'Table' class used as parametrized argument in test functions

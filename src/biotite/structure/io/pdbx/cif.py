@@ -799,9 +799,12 @@ class CIFFile(_Component, File, MutableMapping):
 
     @property
     def block(self):
-        if len(self) != 1:
+        if len(self) == 0:
+            raise ValueError("There are no blocks in the file")
+        elif len(self) > 1:
             raise ValueError("There are multiple blocks in the file")
-        return self[next(iter(self))]
+        else:
+            return self[next(iter(self))]
 
     @staticmethod
     def subcomponent_class():
@@ -896,6 +899,7 @@ class CIFFile(_Component, File, MutableMapping):
                 block = CIFBlock.deserialize(block)
             except Exception:
                 raise DeserializationError(f"Failed to deserialize block '{key}'")
+            block.name = key
             # Update with deserialized object
             self._blocks[key] = block
         return block
